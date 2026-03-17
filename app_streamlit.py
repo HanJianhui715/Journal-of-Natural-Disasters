@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -34,13 +33,14 @@ DEFAULT_FEATURE_COLUMNS: List[str] = [
 ]
 
 
-ROMAN_LEVELS = {1: "Ⅰ级", 2: "Ⅱ级", 3: "Ⅲ级", 4: "Ⅳ级", 5: "Ⅴ级"}
-
-
-@dataclass(frozen=True)
-class ModelPaths:
-    rf_joblib: Path
-    xgb_json: Path
+ROMAN_LEVELS = {1: "Ⅰ", 2: "Ⅱ", 3: "Ⅲ", 4: "Ⅳ", 5: "Ⅴ"}
+LEVEL_TEXT = {
+    1: "基本完好",
+    2: "轻微破坏",
+    3: "中等破坏",
+    4: "严重破坏",
+    5: "倒塌",
+}
 
 
 def _inject_css() -> None:
@@ -55,7 +55,6 @@ def _inject_css() -> None:
     --card:#ffffffcc;
     --stroke:#00000010;
     --accent:#0f766e;
-    --accent2:#b45309;
     --danger:#b91c1c;
   }
 
@@ -99,33 +98,22 @@ def _inject_css() -> None:
     border:1px solid #0f766e2a;
   }
 
-  .badge{
-    display:inline-block;
-    font-size: 14px;
-    padding: 6px 10px;
-    border-radius: 999px;
+  .scale{
+    display:grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap:10px;
+    margin-top: 6px;
+  }
+  .scale .pill{
+    background:#fff;
     border:1px solid var(--stroke);
-    background: #ffffff;
-    color: var(--muted);
+    border-radius: 16px;
+    padding: 10px 10px;
+    text-align:center;
   }
-  .badge-strong{
-    background: #0f766e10;
-    color: var(--accent);
-    border-color: #0f766e2a;
-    font-weight: 700;
-  }
-  .badge-warn{
-    background: #b4530910;
-    color: var(--accent2);
-    border-color:#b453092a;
-    font-weight: 700;
-  }
-  .badge-danger{
-    background: #b91c1c10;
-    color: var(--danger);
-    border-color:#b91c1c2a;
-    font-weight: 700;
-  }
+  .scale .pill .r{ font-weight: 800; font-size: 18px; }
+  .scale .pill .t{ color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .hint{ color: var(--muted); font-size: 12px; }
 </style>
         """,
         unsafe_allow_html=True,
@@ -150,7 +138,8 @@ def _normalize_damage_class(pred: int) -> int:
 
 
 def _damage_to_label(level_1to5: int) -> str:
-    return ROMAN_LEVELS.get(int(level_1to5), "Ⅰ级")
+    lvl = int(level_1to5)
+    return f"{ROMAN_LEVELS.get(lvl, 'Ⅰ')}（{LEVEL_TEXT.get(lvl, '基本完好')}）"
 
 
 @st.cache_resource
@@ -184,6 +173,105 @@ def _build_input_df(
     return df
 
 
+def _rf_expected_feature_names(rf_model) -> Optional[List[str]]:
+    names = getattr(rf_model, "feature_names_in_", None)
+    if names is not None:
+        try:
+            out = [str(x) for x in list(names)]
+            return out or None
+        except Exception:
+            pass
+
+    steps = getattr(rf_model, "named_steps", {}) or {}
+    prep = steps.get("prep")
+    if prep is not None and hasattr(prep, "transformers_"):
+        cols: List[str] = []
+        try:
+            for _, _, c in prep.transformers_:
+                if isinstance(c, (list, tuple, np.ndarray, pd.Index)):
+                    cols.extend([str(x) for x in list(c)])
+            cols = [c for c in cols if c]
+            if cols:
+                # de-duplicate while keeping order
+                seen = set()
+                dedup = []
+                for c in cols:
+                    if c in seen:
+                        continue
+                    seen.add(c)
+                    dedup.append(c)
+                return dedup
+        except Exception:
+            return None
+    return None
+
+
+def _canonical_values(
+    spi: int,
+    isr: float,
+    ecc_x1: float,
+    ecc_y1: float,
+    ecc_x2: float,
+    ecc_y2: float,
+    pga: float,
+) -> List[float]:
+    return [int(spi), float(isr), float(ecc_x1), float(ecc_y1), float(ecc_x2), float(ecc_y2), float(pga)]
+
+
+def _semantic_index(name: str) -> Optional[int]:
+    s = str(name).strip()
+    up = s.upper()
+    low = s.lower()
+
+    # 0: SPI, 1: ISR, 2: ecc_x1, 3: ecc_y1, 4: ecc_x2, 5: ecc_y2, 6: PGA
+    if "PGA" in up:
+        return 6
+    if ("设防" in s) or (low in {"spi", "intensity"}):
+        return 0
+    if ("刚度" in s) or (low in {"isr", "stiffness_ratio"}):
+        return 1
+    if ("一层" in s) and ("X" in up):
+        return 2
+    if ("一层" in s) and ("Y" in up):
+        return 3
+    if ("二层" in s) and ("X" in up):
+        return 4
+    if ("二层" in s) and ("Y" in up):
+        return 5
+    return None
+
+
+def _make_df_for_model(expected_names: Optional[List[str]], values: List[float]) -> pd.DataFrame:
+    if expected_names and len(expected_names) == len(values):
+        mapping: Dict[int, int] = {}
+        used = set()
+        for pos, col in enumerate(expected_names):
+            idx = _semantic_index(str(col))
+            if idx is None or idx in used:
+                continue
+            mapping[pos] = idx
+            used.add(idx)
+
+        # If we can confidently match most columns, assign by semantics; otherwise keep canonical order.
+        row = [None] * len(values)
+        if len(mapping) >= 4:
+            for pos in range(len(expected_names)):
+                if pos in mapping:
+                    row[pos] = values[mapping[pos]]
+            remaining_vals = [values[i] for i in range(len(values)) if i not in used]
+            j = 0
+            for pos in range(len(row)):
+                if row[pos] is None:
+                    row[pos] = remaining_vals[j]
+                    j += 1
+        else:
+            row = list(values)
+
+        return pd.DataFrame([row], columns=list(expected_names))
+    # Fallback: use default names (7 features) in canonical order.
+    return pd.DataFrame([values], columns=DEFAULT_FEATURE_COLUMNS)
+
+
 def _predict_rf_damage(rf_model, X_df: pd.DataFrame) -> Tuple[int, Optional[np.ndarray]]:
     pred = rf_model.predict(X_df)[0]
     prob = None
@@ -198,17 +286,25 @@ def _predict_rf_damage(rf_model, X_df: pd.DataFrame) -> Tuple[int, Optional[np.n
 def _predict_xgb_damage(booster, X_df: pd.DataFrame) -> Tuple[int, Optional[np.ndarray]]:
     import xgboost as xgb
 
-    # Training uses enable_categorical=True and treats "设防烈度" as categorical by default.
-    # If the column exists, enforce int->category so Streamlit input doesn't break categorical splits.
-    for col in X_df.columns:
-        if col.strip() == "设防烈度":
-            X_df[col] = np.round(X_df[col]).astype(int).astype("category")
-
-    # Avoid feature-name mismatch by aligning to booster.feature_names when present.
+    # Keep DataFrame to preserve categorical support; align columns if model has names.
     feat_names = getattr(booster, "feature_names", None)
-    if feat_names and len(feat_names) == X_df.shape[1] and list(feat_names) != list(X_df.columns):
+    if feat_names and len(feat_names) == X_df.shape[1]:
         X_df = X_df.copy()
         X_df.columns = list(feat_names)
+
+    # Make the intensity feature categorical (best-effort: match by name, otherwise first column).
+    intensity_col = None
+    for col in X_df.columns:
+        if "设防" in str(col) or str(col).strip().lower() in {"spi", "intensity"}:
+            intensity_col = col
+            break
+    if intensity_col is None and len(X_df.columns) > 0:
+        intensity_col = X_df.columns[0]
+    if intensity_col is not None:
+        try:
+            X_df[intensity_col] = np.round(X_df[intensity_col]).astype(int).astype("category")
+        except Exception:
+            pass
 
     dmat = xgb.DMatrix(X_df, enable_categorical=True)
     probs = booster.predict(dmat)
@@ -226,6 +322,7 @@ def _predict_xgb_damage(booster, X_df: pd.DataFrame) -> Tuple[int, Optional[np.n
 
 
 def _kpi(label: str, value: str, tag: str, tag_class: str = "tag") -> None:
+    tag_html = f'<div class="{tag_class}">{tag}</div>' if str(tag).strip() else ""
     st.markdown(
         f"""
 <div class="kpi">
@@ -233,29 +330,18 @@ def _kpi(label: str, value: str, tag: str, tag_class: str = "tag") -> None:
     <div class="label">{label}</div>
     <div class="value">{value}</div>
   </div>
-  <div class="{tag_class}">{tag}</div>
+  {tag_html}
 </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _badge(text: str, kind: str = "normal") -> str:
-    cls = "badge"
-    if kind == "strong":
-        cls += " badge-strong"
-    elif kind == "warn":
-        cls += " badge-warn"
-    elif kind == "danger":
-        cls += " badge-danger"
-    return f'<span class="{cls}">{text}</span>'
-
-
-def _resolve_model_paths() -> ModelPaths:
+def _resolve_model_paths() -> Tuple[Path, Path]:
     base = Path(__file__).resolve().parent
     rf = base / "model_rf_底框层间位移角_fold4.joblib"
     xgb = base / "model_xgb_上部砌体层间位移角_fold4.json"
-    return ModelPaths(rf_joblib=rf, xgb_json=xgb)
+    return rf, xgb
 
 
 def main() -> None:
@@ -263,24 +349,8 @@ def main() -> None:
     _inject_css()
 
     st.markdown(f"<h1 style='margin-bottom:6px'>{APP_TITLE}</h1>", unsafe_allow_html=True)
-    st.caption("输入设防烈度、刚度比、偏心率与 PGA，输出框架层/砌体层破坏等级，并给出底框结构整体破坏等级（取最大值）。")
-
-    paths = _resolve_model_paths()
-
-    with st.sidebar:
-        st.markdown("### 模型文件")
-        st.write(f"RF：`{paths.rf_joblib.name}`")
-        st.write(f"XGBoost：`{paths.xgb_json.name}`")
-
-        with st.expander("高级设置：特征列名（如与模型不一致可修改）", expanded=False):
-            cols = []
-            for i, c in enumerate(DEFAULT_FEATURE_COLUMNS):
-                cols.append(st.text_input(f"第{i+1}列", value=c))
-            feature_columns = cols
-            st.caption("提示：RF(joblib) 通常按列名匹配；XGBoost(json) 若保存了特征名，会自动对齐。")
-
-    # Use defaults when expander not opened (Streamlit still defines variables; keep explicit).
-    feature_columns = locals().get("feature_columns", DEFAULT_FEATURE_COLUMNS)
+    st.caption("输入地震与结构参数，输出各层与整体破坏等级。")
+    rf_path, xgb_path = _resolve_model_paths()
 
     col_left, col_right = st.columns([1.3, 1.0], gap="large")
 
@@ -318,21 +388,6 @@ def main() -> None:
                 format="%.4f",
             )
 
-        st.markdown("### 规则提示")
-        floor1_active = (ecc_x1 > 0) or (ecc_y1 > 0)
-        floor2_active = (ecc_x2 > 0) or (ecc_y2 > 0)
-        if floor1_active and floor2_active:
-            st.error("不允许一层与二层同时存在非零偏心率，请将其中一层偏心率置为 0。")
-
-        out_of_range = (
-            not (ECC_RANGES["ecc_x1"][0] <= ecc_x1 <= ECC_RANGES["ecc_x1"][1])
-            or not (ECC_RANGES["ecc_y1"][0] <= ecc_y1 <= ECC_RANGES["ecc_y1"][1])
-            or not (ECC_RANGES["ecc_x2"][0] <= ecc_x2 <= ECC_RANGES["ecc_x2"][1])
-            or not (ECC_RANGES["ecc_y2"][0] <= ecc_y2 <= ECC_RANGES["ecc_y2"][1])
-        )
-        if out_of_range:
-            st.warning("存在偏心率超出建议范围，结果可能外推。")
-
         do_predict = st.button("开始预测", type="primary", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -340,52 +395,69 @@ def main() -> None:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("### 输出结果")
         st.markdown(
-            _badge("框架层：RF(joblib)", "strong")
-            + " "
-            + _badge("砌体层：XGBoost(json)", "strong")
-            + " "
-            + _badge("整体：取最大值", "warn"),
+            """
+<div class="scale">
+  <div class="pill"><div class="r">Ⅰ</div><div class="t">基本完好</div></div>
+  <div class="pill"><div class="r">Ⅱ</div><div class="t">轻微破坏</div></div>
+  <div class="pill"><div class="r">Ⅲ</div><div class="t">中等破坏</div></div>
+  <div class="pill"><div class="r">Ⅳ</div><div class="t">严重破坏</div></div>
+  <div class="pill"><div class="r">Ⅴ</div><div class="t">倒塌</div></div>
+</div>
+            """,
             unsafe_allow_html=True,
         )
-        st.caption("破坏等级按：Ⅰ级 Ⅱ级 Ⅲ级 Ⅳ级 Ⅴ级。")
 
         if do_predict:
-            if floor1_active and floor2_active:
+            if not rf_path.exists():
+                st.error("模型文件缺失，无法完成预测。")
+                st.stop()
+            if not xgb_path.exists():
+                st.error("模型文件缺失，无法完成预测。")
                 st.stop()
 
-            if not paths.rf_joblib.exists():
-                st.error(f"未找到 RF 模型文件：`{paths.rf_joblib.name}`")
+            values = _canonical_values(spi, float(isr), ecc_x1, ecc_y1, ecc_x2, ecc_y2, float(pga))
+
+            rf_model = _load_rf_model(str(rf_path))
+            xgb_booster = _load_xgb_booster(str(xgb_path))
+
+            rf_expected = _rf_expected_feature_names(rf_model)
+            X_rf = _make_df_for_model(rf_expected, values)
+            X_xgb = _make_df_for_model(getattr(xgb_booster, "feature_names", None), values)
+
+            try:
+                rf_level, _ = _predict_rf_damage(rf_model, X_rf)
+            except Exception as exc:
+                st.error("预测失败，请确认输入特征与模型训练时一致。")
+                with st.expander("技术细节", expanded=False):
+                    st.write(str(exc))
+                    st.write("RF期望列名：", rf_expected)
+                    st.write("当前列名：", list(X_rf.columns))
                 st.stop()
-            if not paths.xgb_json.exists():
-                st.error(f"未找到 XGBoost 模型文件：`{paths.xgb_json.name}`")
+
+            try:
+                xgb_level, _ = _predict_xgb_damage(xgb_booster, X_xgb.copy())
+            except Exception as exc:
+                st.error("预测失败，请确认输入特征与模型训练时一致。")
+                with st.expander("技术细节", expanded=False):
+                    st.write(str(exc))
+                    st.write("XGBoost列名：", getattr(xgb_booster, "feature_names", None))
+                    st.write("当前列名：", list(X_xgb.columns))
                 st.stop()
 
-            X = _build_input_df(feature_columns, spi, float(isr), ecc_x1, ecc_y1, ecc_x2, ecc_y2, float(pga))
-
-            rf_model = _load_rf_model(str(paths.rf_joblib))
-            xgb_booster = _load_xgb_booster(str(paths.xgb_json))
-
-            rf_level, rf_prob = _predict_rf_damage(rf_model, X)
-            xgb_level, xgb_prob = _predict_xgb_damage(xgb_booster, X.copy())
             overall_level = max(rf_level, xgb_level)
 
-            _kpi("框架层破坏等级（RF）", _damage_to_label(rf_level), "RF")
+            _kpi("框架层破坏等级", _damage_to_label(rf_level), "")
             st.write("")
-            _kpi("砌体层破坏等级（XGBoost）", _damage_to_label(xgb_level), "XGBoost")
+            _kpi("砌体层破坏等级", _damage_to_label(xgb_level), "")
             st.write("")
-            _kpi("底框结构破坏等级（max）", _damage_to_label(overall_level), "Overall", tag_class="tag")
+            _kpi("底框结构破坏等级", _damage_to_label(overall_level), "")
 
             st.markdown("---")
-            with st.expander("查看输入与置信度（可选）", expanded=False):
-                st.dataframe(X, use_container_width=True, hide_index=True)
-                if rf_prob is not None:
-                    st.write("RF 各等级概率（按模型内部类别顺序）：")
-                    st.write(np.round(rf_prob, 4))
-                if xgb_prob is not None:
-                    st.write("XGBoost 各等级概率（按 0..4）：")
-                    st.write(np.round(xgb_prob, 4))
+            X_show = _build_input_df(DEFAULT_FEATURE_COLUMNS, spi, float(isr), ecc_x1, ecc_y1, ecc_x2, ecc_y2, float(pga))
+            st.markdown("<div class='hint'>输入参数</div>", unsafe_allow_html=True)
+            st.dataframe(X_show, use_container_width=True, hide_index=True)
         else:
-            st.info("在左侧输入特征后，点击“开始预测”。")
+            st.info("输入参数后，点击“开始预测”。")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
